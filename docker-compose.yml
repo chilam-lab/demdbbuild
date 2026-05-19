@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  species-middleware:
+    container_name: middleware_speciesv3
+    build:
+      context: ./middleware_speciesv3
+      dockerfile: Dockerfile
+    ports:
+      - "8585:8080"
+    restart: unless-stopped
+    environment:
+      PORT: ${PORT:-8080}
+      DBHOST: ${DBHOST}
+      DBPORT: ${DBPORT:-5432}
+      DBNAME: ${DBNAME}
+      DBUSER: ${DBUSER}
+      DBPWD: ${DBPWD}
+      DBHOST_MALLAS: ${DBHOST_MALLAS}
+      DBPORT_MALLAS: ${DBPORT_MALLAS:-5432}
+      DBNAME_MALLAS: ${DBNAME_MALLAS}
+      DBUSER_MALLAS: ${DBUSER_MALLAS}
+      DBPWD_MALLAS: ${DBPWD_MALLAS}
+      EUSER: ${EUSER}
+      EPASS: ${EPASS}
+      EHOST: ${EHOST}
+      EPORT: ${EPORT}
+      SEED: ${SEED}
+      TIME_TOKEN: ${TIME_TOKEN}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY}
+      ZACATUCHE_HOST: ${ZACATUCHE_HOST}
+      MANATI_HOST: ${MANATI_HOST}
+      SPECIES_HOST: ${SPECIES_HOST}
+
+  dem-postgis:
+    image: postgis/postgis:16-3.4
+    container_name: dem_postgis
+    restart: unless-stopped
+    ports:
+      - "5444:5432"
+    environment:
+      POSTGRES_DB: dem_db
+      POSTGRES_USER: dem_user
+      POSTGRES_PASSWORD: dem_pass
+    volumes:
+      - dem_postgis_data:/var/lib/postgresql/data
+      - ./dbbuild/sql/01_init_dem_db.sql:/docker-entrypoint-initdb.d/01_init_dem_db.sql:ro
+
+volumes:
+  dem_postgis_data:
