@@ -46,8 +46,8 @@ CREATE TABLE IF NOT EXISTS dem_bins (
     UNIQUE(source_var_id, bin_index)
 );
 
--- Mantiene convención de IDs de catálogo tipo WorldClim (300000+).
-ALTER SEQUENCE IF EXISTS dem_bins_id_seq RESTART WITH 300000;
+-- Nota: NO reiniciar secuencia aquí. Este script corre en cada ejecución del ETL.
+-- Si se requiere iniciar en 300000, hacerlo una sola vez al aprovisionar la base.
 
 CREATE INDEX IF NOT EXISTS idx_dem_bins_source_var_id ON dem_bins (source_var_id);
 CREATE INDEX IF NOT EXISTS idx_dem_source_vars_data_source_id ON dem_source_vars (data_source_id);

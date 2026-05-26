@@ -45,6 +45,8 @@ DICT_URL = "https://worldclim.org/data/bioclim.html"
 FILTER_FIELDS = '{"area":"string","bins":"integer","categoria":"string"}'
 DEM_LABEL = "Shuttle Radar Topography Mission (SRTM)"
 DEM_LAYER = "dem001"
+CREATE_MESH_FDW_SQL = SQL_DIR / "02_create_mesh_fdw.sql"
+UPDATE_AVAILABLE_GRIDS_SQL = SQL_DIR / "03_update_available_grids.sql"
 
 
 def setup_logger() -> logging.Logger:
@@ -209,6 +211,52 @@ def init_db(logger: logging.Logger) -> None:
     logger.info("DB initialized")
 
 
+def configure_mesh_fdw(logger: logging.Logger) -> None:
+    # Configura FDW hacia meshandregions_db para consultar cat_grid y mallas.
+    db_mesh_name = os.getenv("DBMESHNAME")
+    db_mesh_host = os.getenv("DBMESHHOST")
+    db_mesh_port = os.getenv("DBMESHPORT")
+    db_mesh_user = os.getenv("DBMESHUSER")
+    db_mesh_pass = os.getenv("DBMESHPASSWD")
+
+    required = {
+        "DBMESHNAME": db_mesh_name,
+        "DBMESHHOST": db_mesh_host,
+        "DBMESHPORT": db_mesh_port,
+        "DBMESHUSER": db_mesh_user,
+        "DBMESHPASSWD": db_mesh_pass,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        logger.warning("Skipping available_grids: missing env vars: %s", ", ".join(missing))
+        return
+
+    mesh_fdw_sql = load_sql(CREATE_MESH_FDW_SQL)
+    mesh_fdw_sql = mesh_fdw_sql.replace("__MESHDB_HOST__", db_mesh_host)
+    mesh_fdw_sql = mesh_fdw_sql.replace("__MESHDB_PORT__", db_mesh_port)
+    mesh_fdw_sql = mesh_fdw_sql.replace("__MESHDB_NAME__", db_mesh_name)
+    mesh_fdw_sql = mesh_fdw_sql.replace("__MESHDB_USER__", db_mesh_user)
+    mesh_fdw_sql = mesh_fdw_sql.replace("__MESHDB_PASS__", db_mesh_pass.replace("'", "''"))
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(mesh_fdw_sql)
+    logger.info("FDW configured for mesh DB")
+
+
+def update_available_grids(source_var_id: int, nbins: int, logger: logging.Logger) -> None:
+    # Calcula available_grids para esta corrida a partir de intersección DEM vs mallas.
+    table_name = f"dem_elev_q{nbins}"
+    update_sql = load_sql(UPDATE_AVAILABLE_GRIDS_SQL)
+    update_sql = update_sql.replace("__DEM_TABLE__", table_name)
+    update_sql = update_sql.replace("__SOURCE_VAR_ID__", str(source_var_id))
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(update_sql)
+    logger.info("available_grids updated for source_var_id=%s", source_var_id)
+
+
 def upsert_source_and_bins(nbins: int, bins_meta: list[tuple[int, float, float, str]], logger: logging.Logger) -> int:
     # Inserta/actualiza el registro de fuente DEM y refresca rangos de bins.
     from psycopg2.extras import execute_values
@@ -287,6 +335,15 @@ def upsert_source_and_bins(nbins: int, bins_meta: list[tuple[int, float, float, 
 
             # Se reinsertan bins para mantener consistencia si cambia nbins.
             cur.execute("DELETE FROM dem_bins WHERE source_var_id = %s", (source_var_id,))
+            cur.execute(
+                """
+                SELECT setval(
+                    'public.dem_bins_id_seq',
+                    COALESCE((SELECT MAX(id) FROM dem_bins), 299999) + 1,
+                    false
+                );
+                """
+            )
             execute_values(
                 cur,
                 """
@@ -369,7 +426,8 @@ def load_polygons_to_postgis(nbins: int, source_var_id: int, logger: logging.Log
                 ADD COLUMN IF NOT EXISTS bin_index INTEGER,
                 ADD COLUMN IF NOT EXISTS bin_label TEXT,
                 ADD COLUMN IF NOT EXISTS min_value DOUBLE PRECISION,
-                ADD COLUMN IF NOT EXISTS max_value DOUBLE PRECISION;
+                ADD COLUMN IF NOT EXISTS max_value DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS value DOUBLE PRECISION;
                 """
             )
             cur.execute(
@@ -381,7 +439,8 @@ def load_polygons_to_postgis(nbins: int, source_var_id: int, logger: logging.Log
                     bin_index = p.{bin_col},
                     bin_label = b.tag,
                     min_value = b.min_value,
-                    max_value = b.max_value
+                    max_value = b.max_value,
+                    value = (b.min_value + b.max_value) / 2.0
                 FROM dem_bins b
                 WHERE b.source_var_id = %s
                   AND b.bin_index = p.{bin_col};
@@ -436,6 +495,8 @@ def main() -> int:
     init_db(logger)
     source_var_id = upsert_source_and_bins(args.nbins, bins_meta, logger)
     load_polygons_to_postgis(args.nbins, source_var_id, logger)
+    configure_mesh_fdw(logger)
+    update_available_grids(source_var_id, args.nbins, logger)
 
     logger.info("DEM build completed successfully")
     return 0
