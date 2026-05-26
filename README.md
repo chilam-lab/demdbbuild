@@ -122,3 +122,58 @@ limit 20;
 Este módulo cubre únicamente la construcción y carga de base de datos DEM.
 
 La capa de servicios/middleware se integrará en una fase posterior del proyecto.
+
+## middleware_dem
+
+`middleware_dem` expone la información construida por `dbbuild` bajo un contrato compatible con SPECIES v3, usando el prefijo de rutas `demv3`.
+
+### Estructura relevante
+
+```text
+middleware_dem/
+├── .env.example
+├── config.js
+├── package.json
+└── src/
+    ├── server.js
+    ├── routes/
+    │   └── demv3router.js
+    └── controllers/
+        ├── demv3_controller.js
+        └── verb_utils.js
+```
+
+### Variables de entorno (`middleware_dem/.env`)
+
+```env
+PORT=
+
+DBNAME=
+DBUSER=
+DBPWD=
+DBHOST=
+DBPORT=
+
+DBNAME_MALLAS=
+DBUSER_MALLAS=
+DBPWD_MALLAS=
+DBHOST_MALLAS=
+DBPORT_MALLAS=
+```
+
+### Ejecución
+
+```bash
+cd middleware_dem
+npm install
+npm run dev
+```
+
+### Endpoints base
+
+- `GET/POST /demv3/`
+- `GET/POST /demv3/db-health`
+- `GET/POST /demv3/variables`
+- `GET/POST /demv3/variables/:id`
+- `GET/POST /demv3/get-data/:id`
+- `GET/POST /demv3/info`
