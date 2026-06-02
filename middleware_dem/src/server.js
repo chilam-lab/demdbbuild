@@ -34,7 +34,7 @@ app.use(session({
 }));
 
 var demv3Router = require('./routes/demv3router');
-app.use('/demv3', demv3Router);
+app.use('/dem', demv3Router);
 
 var server = app.listen(port, function () {
   var listenPort = server.address().port;
