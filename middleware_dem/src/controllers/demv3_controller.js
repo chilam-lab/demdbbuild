@@ -8,6 +8,18 @@ var pool_mallas = verb_utils.pool_mallas;
 var valid_filters = ['levels_id', 'categoria', 'tag', 'layer'];
 var MAX_LIMIT = 500;
 var MAX_LEVELS = 500;
+var GEOM_CHUNK_SIZE = 500;
+
+const gridResolutionCache = new Map(); // grid_id → { cellColumn, resolvedTable }
+const demVarCache = new Map();          // variable_id → { bins, demTableName }
+const resultCache = new Map();          // cacheKey → { data, ts }
+const RESULT_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora
+
+function buildResultCacheKey(variable_id, grid_id, levels_id, filter_names, filter_values) {
+  const lvls = levels_id.slice().sort((a, b) => a - b).join(',');
+  const filters = filter_names.map((n, i) => `${n}=${filter_values[i]}`).join(';');
+  return `${variable_id}:${grid_id}:${lvls}:${filters}`;
+}
 
 async function resolveGridTableName(poolMallas, tableCellName) {
   const candidate = String(tableCellName || '').trim().toLowerCase();
@@ -50,6 +62,64 @@ async function resolveGridTableName(poolMallas, tableCellName) {
   }
 
   return null;
+}
+
+const ALLOWED_CELL_TABLES = [
+  'grid_64km_aoi',
+  'grid_32km_aoi',
+  'grid_16km_aoi',
+  'grid_8km_aoi',
+  'grid_state_aoi',
+  'grid_mun_aoi',
+  'grid_ageb_aoi',
+  'grid_cue_aoi'
+];
+
+async function getDemVar(variable_id) {
+  if (demVarCache.has(variable_id)) return demVarCache.get(variable_id);
+
+  const variableRow = await pool.oneOrNone(
+    'SELECT id, bins FROM dem_source_vars WHERE id = $1',
+    [variable_id]
+  );
+  if (!variableRow) return null;
+
+  const demTableName = `dem_elev_q${variableRow.bins}`;
+  const tableReg = await pool.oneOrNone('SELECT to_regclass($1) AS reg', [`public.${demTableName}`]);
+  if (!tableReg || !tableReg.reg) return null;
+
+  const result = { bins: variableRow.bins, demTableName };
+  demVarCache.set(variable_id, result);
+  return result;
+}
+
+async function getGridResolution(grid_id) {
+  if (gridResolutionCache.has(grid_id)) return gridResolutionCache.get(grid_id);
+
+  const gridInfo = await pool_mallas.oneOrNone(
+    'SELECT resolution, table_cell_name FROM cat_grid WHERE grid_id = $1',
+    [grid_id]
+  );
+  if (!gridInfo) return null;
+
+  const tableCellName = String(gridInfo.table_cell_name || '').trim();
+  const cellColumn = `gridid_${String(gridInfo.resolution).toLowerCase()}`;
+
+  if (!ALLOWED_CELL_TABLES.includes(tableCellName)) return null;
+
+  const resolvedTable = await resolveGridTableName(pool_mallas, tableCellName);
+  if (!resolvedTable) return null;
+
+  const colExists = await pool_mallas.oneOrNone(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
+    [resolvedTable, cellColumn]
+  );
+  if (!colExists) return null;
+
+  const result = { cellColumn, resolvedTable };
+  gridResolutionCache.set(grid_id, result);
+  return result;
 }
 
 exports.variables = async function (req, res) {
@@ -219,68 +289,27 @@ exports.get_data_byid = async function (req, res) {
       return res.status(400).json({ message: 'filter_names debe contener solo strings' });
     }
 
-    const variableRow = await pool.oneOrNone(
-      'SELECT id, bins FROM dem_source_vars WHERE id = $1',
-      [variable_id]
-    );
-
-    if (!variableRow) {
-      return res.status(404).json({ message: 'No existe la variable solicitada' });
+    const cacheKey = buildResultCacheKey(variable_id, grid_id, levels_id, filter_names, filter_values);
+    const cached = resultCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL_MS) {
+      return res.status(200).json(cached.data);
     }
 
-    const demTableName = `dem_elev_q${variableRow.bins}`;
-    const demTableReg = await pool.oneOrNone('SELECT to_regclass($1) AS reg', [`public.${demTableName}`]);
-    if (!demTableReg || !demTableReg.reg) {
-      return res.status(500).json({ message: `No existe la tabla espacial esperada: ${demTableName}` });
+    // Resolución en paralelo — ambas funciones tienen caché interno
+    const [demVar, gridRes] = await Promise.all([
+      getDemVar(variable_id),
+      getGridResolution(grid_id)
+    ]);
+
+    if (!demVar) {
+      return res.status(404).json({ message: 'No existe la variable solicitada o su tabla espacial' });
+    }
+    if (!gridRes) {
+      return res.status(404).json({ message: 'No existe la malla solicitada o su configuración es inválida' });
     }
 
-    const gridInfo = await pool_mallas.oneOrNone(
-      'SELECT resolution, table_cell_name FROM cat_grid WHERE grid_id = $1',
-      [grid_id]
-    );
-
-    if (!gridInfo) {
-      return res.status(404).json({ message: 'No existe la malla solicitada (grid_id)' });
-    }
-
-    const cellColumn = `gridid_${String(gridInfo.resolution).toLowerCase()}`;
-    const tableCellName = String(gridInfo.table_cell_name || '').trim();
-
-    const allowedCellTables = [
-      'grid_64km_aoi',
-      'grid_32km_aoi',
-      'grid_16km_aoi',
-      'grid_8km_aoi',
-      'grid_state_aoi',
-      'grid_mun_aoi',
-      'grid_ageb_aoi',
-      'grid_cue_aoi'
-    ];
-
-    if (!allowedCellTables.includes(tableCellName)) {
-      return res.status(400).json({ message: `table_cell_name no permitido: ${tableCellName}` });
-    }
-
-    const resolvedCellTable = await resolveGridTableName(pool_mallas, tableCellName);
-    if (!resolvedCellTable) {
-      return res.status(500).json({
-        message: `No se encontró tabla de celdas para grid_id=${grid_id} (table_cell_name=${tableCellName})`
-      });
-    }
-
-    const cellColumnExists = await pool_mallas.oneOrNone(
-      `SELECT 1
-       FROM information_schema.columns
-       WHERE table_schema = 'public'
-         AND table_name = $1
-         AND column_name = $2`,
-      [resolvedCellTable, cellColumn]
-    );
-    if (!cellColumnExists) {
-      return res.status(500).json({
-        message: `La columna de celda ${cellColumn} no existe en ${resolvedCellTable}`
-      });
-    }
+    const { demTableName } = demVar;
+    const { cellColumn, resolvedTable: resolvedCellTable } = gridRes;
 
     const conditionParts = ['d.source_var_id = $1', 'b.id IN ($2:csv)'];
     const values = [variable_id, levels_id];
@@ -322,26 +351,35 @@ exports.get_data_byid = async function (req, res) {
     const whereSql = `WHERE ${conditionParts.join(' AND ')}`;
 
     const query = `
+      WITH numbered AS (
+        SELECT
+          d.the_geom,
+          b.id AS bid,
+          b.layer, b.tag, b.label, b.bin_index, b.min_value, b.max_value,
+          floor((row_number() OVER (PARTITION BY b.id ORDER BY d.id) - 1) / ${GEOM_CHUNK_SIZE}) AS chunk_idx
+        FROM ${pgp.as.name(demTableName)} d
+        JOIN dem_bins b
+          ON b.source_var_id = d.source_var_id
+         AND b.bin_index = d.bin_index
+        ${whereSql}
+      )
       SELECT
         $1::int AS id,
-        b.id AS level_id,
+        bid AS level_id,
+        chunk_idx,
         jsonb_build_object(
-          'categoria', b.layer,
-          'tag', b.tag,
-          'label', b.label,
-          'bin_index', b.bin_index,
-          'min_value', b.min_value,
-          'max_value', b.max_value,
-          'value', (b.min_value + b.max_value) / 2.0
+          'categoria', layer,
+          'tag', tag,
+          'label', label,
+          'bin_index', bin_index,
+          'min_value', min_value,
+          'max_value', max_value,
+          'value', (min_value + max_value) / 2.0
         ) AS metadata,
-        array_agg(ST_AsText(d.the_geom)) AS geoms
-      FROM ${pgp.as.name(demTableName)} d
-      JOIN dem_bins b
-        ON b.source_var_id = d.source_var_id
-       AND b.bin_index = d.bin_index
-      ${whereSql}
-      GROUP BY b.id, b.layer, b.tag, b.label, b.bin_index, b.min_value, b.max_value
-      ORDER BY b.bin_index;
+        ST_AsText(ST_Collect(the_geom)) AS geom_chunk
+      FROM numbered
+      GROUP BY bid, layer, tag, label, bin_index, min_value, max_value, chunk_idx
+      ORDER BY bin_index, chunk_idx;
     `;
 
     const data = await pool.any(query, values);
@@ -349,52 +387,43 @@ exports.get_data_byid = async function (req, res) {
       return res.status(200).json([]);
     }
 
-    const responseArray = [];
+    const meshQuery = `
+      SELECT DISTINCT g.${pgp.as.name(cellColumn)} AS cell
+      FROM (SELECT ST_Subdivide(ST_GeomFromText($1, 4326), 64) AS geom) sub
+      JOIN ${pgp.as.name(resolvedCellTable)} g ON ST_Intersects(g.the_geom, sub.geom)
+      ORDER BY cell;
+    `;
+
+    // Agrupar chunks por level_id
+    const levelMap = new Map();
     for (const row of data) {
-      const geoms = Array.isArray(row.geoms) ? row.geoms.filter(Boolean) : [];
-      if (geoms.length === 0) {
-        responseArray.push({
-          id: row.id,
-          grid_id: grid_id,
-          level_id: row.level_id,
-          metadata: row.metadata,
-          cells: [],
-          n: 0,
-        });
-        continue;
+      if (!levelMap.has(row.level_id)) {
+        levelMap.set(row.level_id, { id: row.id, level_id: row.level_id, metadata: row.metadata, geomChunks: [] });
       }
-
-      const queryPoints = geoms
-        .map((wkt) => `ST_SetSRID(ST_GeomFromText('${String(wkt).replace(/'/g, "''")}'), 4326)`)
-        .join(', ');
-
-      const meshQuery = `
-        WITH dem_geom AS (
-          SELECT unnest(ARRAY[${queryPoints}]) AS geom
-        )
-        SELECT DISTINCT g.${pgp.as.name(cellColumn)} AS cell
-        FROM dem_geom d
-        JOIN ${pgp.as.name(resolvedCellTable)} g
-          ON g.the_geom IS NOT NULL
-         AND d.geom IS NOT NULL
-         AND g.the_geom && d.geom
-         AND ST_Intersects(g.the_geom, d.geom)
-        ORDER BY cell;
-      `;
-
-      const meshRows = await pool_mallas.any(meshQuery, {});
-      const cells = meshRows.map((r) => r.cell);
-
-      responseArray.push({
-        id: row.id,
-        grid_id: grid_id,
-        level_id: row.level_id,
-        metadata: row.metadata,
-        cells,
-        n: cells.length,
-      });
+      if (row.geom_chunk) {
+        levelMap.get(row.level_id).geomChunks.push(row.geom_chunk);
+      }
     }
 
+    // Por cada bin: todos sus chunks en paralelo → deduplicar celdas
+    const responseArray = await Promise.all(
+      Array.from(levelMap.values()).map(async ({ id, level_id, metadata, geomChunks }) => {
+        if (geomChunks.length === 0) {
+          return { id, grid_id, level_id, metadata, cells: [], n: 0 };
+        }
+        const chunkResults = await Promise.all(
+          geomChunks.map((chunk) => pool_mallas.any(meshQuery, [chunk]))
+        );
+        const cellSet = new Set();
+        for (const rows of chunkResults) {
+          for (const r of rows) cellSet.add(r.cell);
+        }
+        const cells = Array.from(cellSet).sort((a, b) => (a < b ? -1 : 1));
+        return { id, grid_id, level_id, metadata, cells, n: cells.length };
+      })
+    );
+
+    resultCache.set(cacheKey, { data: responseArray, ts: Date.now() });
     return res.status(200).json(responseArray);
   } catch (error) {
     debug(error);
