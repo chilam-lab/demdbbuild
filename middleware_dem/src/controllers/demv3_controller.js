@@ -97,7 +97,7 @@ async function getGridResolution(grid_id) {
   if (gridResolutionCache.has(grid_id)) return gridResolutionCache.get(grid_id);
 
   const gridInfo = await pool_mallas.oneOrNone(
-    'SELECT resolution, table_cell_name FROM cat_grid WHERE grid_id = $1',
+    'SELECT resolution, table_cell_name, table_view_name, region_id FROM cat_grid WHERE grid_id = $1',
     [grid_id]
   );
   if (!gridInfo) return null;
@@ -117,7 +117,10 @@ async function getGridResolution(grid_id) {
   );
   if (!colExists) return null;
 
-  const result = { cellColumn, resolvedTable };
+  const tableViewName = String(gridInfo.table_view_name || '').trim();
+  const region_id     = gridInfo.region_id || null;
+
+  const result = { cellColumn, resolvedTable, tableViewName, region_id };
   gridResolutionCache.set(grid_id, result);
   return result;
 }
@@ -271,9 +274,8 @@ exports.get_data_byid = async function (req, res) {
       return res.status(400).json({ message: 'El parámetro grid_id es inválido' });
     }
 
-    const levels_id = Array.isArray(levels_id_raw)
-      ? levels_id_raw.map(Number).filter((n) => Number.isInteger(n) && n > 0)
-      : [];
+    const levels_id_arr = Array.isArray(levels_id_raw) ? levels_id_raw : [levels_id_raw];
+    const levels_id = levels_id_arr.map(Number).filter((n) => Number.isInteger(n) && n > 0);
 
     if (levels_id.length === 0) {
       return res.status(400).json({ message: 'levels_id debe ser un arreglo con al menos un valor válido' });
@@ -309,7 +311,7 @@ exports.get_data_byid = async function (req, res) {
     }
 
     const { demTableName } = demVar;
-    const { cellColumn, resolvedTable: resolvedCellTable } = gridRes;
+    const { cellColumn, resolvedTable: resolvedCellTable, tableViewName, region_id } = gridRes;
 
     const conditionParts = ['d.source_var_id = $1', 'b.id IN ($2:csv)'];
     const values = [variable_id, levels_id];
@@ -387,12 +389,27 @@ exports.get_data_byid = async function (req, res) {
       return res.status(200).json([]);
     }
 
-    const meshQuery = `
-      SELECT DISTINCT g.${pgp.as.name(cellColumn)} AS cell
-      FROM (SELECT ST_Subdivide(ST_GeomFromText($1, 4326), 64) AS geom) sub
-      JOIN ${pgp.as.name(resolvedCellTable)} g ON ST_Intersects(g.the_geom, sub.geom)
-      ORDER BY cell;
-    `;
+    // Recorta las celdas a la región del grid (ej. México) antes de intersectar
+    // con la geometría del bin DEM, evitando que nj supere el total n de la región.
+    const meshQuery = (tableViewName && region_id)
+      ? `
+        WITH regionarea AS (
+          SELECT g.${pgp.as.name(cellColumn)} AS cell, g.the_geom
+          FROM ${pgp.as.name(resolvedCellTable)} g
+          JOIN ${pgp.as.name(tableViewName)} vg ON ST_Intersects(g.the_geom, vg.border)
+          WHERE vg.region_id = ${region_id}
+        )
+        SELECT DISTINCT ra.cell
+        FROM (SELECT ST_Subdivide(ST_GeomFromText($1, 4326), 64) AS geom) sub
+        JOIN regionarea ra ON ST_Intersects(ra.the_geom, sub.geom)
+        ORDER BY cell;
+      `
+      : `
+        SELECT DISTINCT g.${pgp.as.name(cellColumn)} AS cell
+        FROM (SELECT ST_Subdivide(ST_GeomFromText($1, 4326), 64) AS geom) sub
+        JOIN ${pgp.as.name(resolvedCellTable)} g ON ST_Intersects(g.the_geom, sub.geom)
+        ORDER BY cell;
+      `;
 
     // Agrupar chunks por level_id
     const levelMap = new Map();
