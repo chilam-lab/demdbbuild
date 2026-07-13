@@ -127,7 +127,7 @@ async function getGridResolution(grid_id) {
 
 exports.variables = async function (req, res) {
   try {
-    const data = await pool.any(
+    const sourceVars = await pool.any(
       `SELECT
          id,
          (lower(variable_name) || '_q' || bins::text) AS variable,
@@ -138,6 +138,27 @@ exports.variables = async function (req, res) {
        ORDER BY id;`,
       {}
     );
+
+    // Expone dos niveles por variable: el nivel selector y el nivel de categorías.
+    // Esto permite que taxon-navigator navegue elevation_q10 → categoria,
+    // análogo a WorldClim: Fuente → Layer → Rango.
+    const data = [];
+    for (const sv of sourceVars) {
+      data.push({
+        id: sv.id * 2 - 1,           // 1 para la primera variable
+        variable: sv.variable,         // 'elevation_q10'  ← nivel del selector
+        level_size: 1,
+        filter_fields: {},
+        available_grids: sv.available_grids
+      });
+      data.push({
+        id: sv.id * 2,                // 2 para la primera variable
+        variable: 'categoria',         // ← nivel del navegador (bins)
+        level_size: sv.level_size,
+        filter_fields: { categoria: 'integer' },
+        available_grids: sv.available_grids
+      });
+    }
 
     return res.status(200).json({ data });
   } catch (error) {
@@ -150,59 +171,107 @@ exports.variables = async function (req, res) {
 
 exports.get_variable_byid = async function (req, res) {
   try {
-    const variable_id = Number(req.params.id);
+    const virtual_id = Number(req.params.id);
     const q = verb_utils.getParam(req, 'q', '');
     const offset = Number(verb_utils.getParam(req, 'offset', 0));
-    const limit = Number(verb_utils.getParam(req, 'limit', 10));
+    const limit = Math.min(Number(verb_utils.getParam(req, 'limit', 10)), MAX_LIMIT);
 
-    if (!Number.isInteger(variable_id) || variable_id <= 0) {
+    if (!Number.isInteger(virtual_id) || virtual_id <= 0) {
       return res.status(400).json({ message: 'El parámetro id es inválido' });
     }
 
-    if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit <= 0 || limit > MAX_LIMIT) {
+    if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit <= 0) {
       return res.status(400).json({ message: 'Parámetros offset/limit inválidos' });
     }
 
-    const variableRow = await pool.oneOrNone(
-      'SELECT id FROM dem_source_vars WHERE id = $1',
-      [variable_id]
+    // Las IDs virtuales del endpoint /variables son id*2-1 (nivel padre) y id*2 (nivel hijo).
+    // Mapear de vuelta al source_var_id real en dem_source_vars.
+    let variableRow = await pool.oneOrNone(
+      `SELECT id, (lower(variable_name) || '_q' || bins::text) AS varname
+       FROM dem_source_vars WHERE id = $1`,
+      [virtual_id]
     );
+    let source_var_id = virtual_id;
 
     if (!variableRow) {
-      return res.status(404).json({ message: 'No existe la variable solicitada' });
+      const real_id = Math.ceil(virtual_id / 2);
+      variableRow = await pool.oneOrNone(
+        `SELECT id, (lower(variable_name) || '_q' || bins::text) AS varname
+         FROM dem_source_vars WHERE id = $1`,
+        [real_id]
+      );
+      if (!variableRow) {
+        return res.status(404).json({ message: 'No existe la variable solicitada' });
+      }
+      source_var_id = real_id;
     }
 
+    const varName = (variableRow.varname ?? '').toLowerCase(); // ej. 'elevation_q10'
+
+    // ─── Modo A: búsqueda del taxon-selector ─────────────────────────────────────
+    // mdf envía: q = "elevation_q10 = <texto>" — el nombre de la variable como filtro.
+    // Devuelve la fuente DEM como item seleccionable (no los bins).
+    if (q !== '') {
+      const firstSegment = q.split(';')[0].trim();
+      const eqIdx = firstSegment.indexOf('=');
+      if (eqIdx > -1) {
+        const filterKey = firstSegment.slice(0, eqIdx).trim().toLowerCase();
+        if (filterKey === varName) {
+          // Devuelve todas las fuentes DEM sin filtrar por texto: hay muy pocas (1-3)
+          // y cualquier texto de 3+ chars indica intención de usar DEM.
+          const sourceRows = await pool.any(
+            `SELECT id, variable_name, bins FROM dem_source_vars ORDER BY id LIMIT $1 OFFSET $2`,
+            [limit, offset]
+          );
+          const data = sourceRows.map(row => ({
+            id: virtual_id,
+            level_id: [row.id],
+            data: {
+              idfuente: row.id,
+              descripcion: `${row.variable_name} (percentil ${row.bins}%)`,
+              bins: row.bins
+            }
+          }));
+          return res.status(200).json({ data });
+        }
+      }
+    }
+
+    // ─── Modo B/C: retorna bins ───────────────────────────────────────────────────
+    // Usado por el análisis (q = "idfuente=X; categoria=1,2,3") y por getTaxonChildren.
+    // 'categoria' filtra por b.id (bin ID entero), 'idfuente' filtra por source_var_id.
     const conditions = ['b.source_var_id = $1'];
-    const values = [variable_id];
+    const values = [source_var_id];
     let paramIdx = 2;
 
     if (q !== '') {
-      const filter_separator = ';';
-      const pair_separator = '=';
-      const group_separator = ',';
-
-      const array_queries = q.split(filter_separator).map(x => x.trim()).filter(Boolean);
+      const array_queries = q.split(';').map(x => x.trim()).filter(Boolean);
 
       for (const filter of array_queries) {
-        const filter_pair = filter.split(pair_separator);
-        if (filter_pair.length !== 2) {
-          return res.status(400).json({ message: `Filtro inválido por composición: ${filter}` });
-        }
+        const eqIdx = filter.indexOf('=');
+        if (eqIdx === -1) continue;
 
-        const filter_param = filter_pair[0].trim();
-        if (valid_filters.indexOf(filter_param) === -1) {
-          return res.status(400).json({ message: `Filtro inválido: ${filter_param}` });
-        }
-
-        const filter_values = filter_pair[1].trim().split(group_separator).map(v => v.trim()).filter(Boolean);
-        if (filter_values.length === 0) {
-          return res.status(400).json({ message: `Filtro sin valores: ${filter_param}` });
-        }
+        const filter_param = filter.slice(0, eqIdx).trim().toLowerCase();
+        const filter_values = filter.slice(eqIdx + 1).trim().split(',').map(v => v.trim()).filter(Boolean);
+        if (filter_values.length === 0) continue;
 
         if (filter_param === 'levels_id') {
           const ids = filter_values.map(Number).filter(n => Number.isInteger(n) && n > 0);
+          if (ids.length > 0) {
+            conditions.push(`b.id IN ($${paramIdx}:csv)`);
+            values.push(ids);
+            paramIdx += 1;
+          }
+          continue;
+        }
+
+        if (filter_param === 'categoria') {
+          // Los valores son IDs de bin (enteros).
+          // Si no hay enteros válidos (ej. texto del selector como "Dem"), devolver vacío
+          // en lugar de ignorar el filtro y retornar todos los bins.
+          const ids = filter_values.map(Number).filter(n => Number.isInteger(n) && n > 0);
           if (ids.length === 0) {
-            return res.status(400).json({ message: 'levels_id no contiene valores válidos' });
+            return res.status(200).json({ data: [] });
           }
           conditions.push(`b.id IN ($${paramIdx}:csv)`);
           values.push(ids);
@@ -210,10 +279,21 @@ exports.get_variable_byid = async function (req, res) {
           continue;
         }
 
-        if (filter_param === 'categoria' || filter_param === 'layer') {
+        if (filter_param === 'layer') {
           conditions.push(`lower(b.layer) IN ($${paramIdx}:csv)`);
-          values.push(filter_values.map(v => String(v).toLowerCase()));
+          values.push(filter_values.map(v => v.toLowerCase()));
           paramIdx += 1;
+          continue;
+        }
+
+        if (filter_param === 'idfuente') {
+          // idfuente equivale a source_var_id en DEM
+          const ids = filter_values.map(Number).filter(n => Number.isInteger(n) && n > 0);
+          if (ids.length > 0) {
+            conditions.push(`b.source_var_id IN ($${paramIdx}:csv)`);
+            values.push(ids);
+            paramIdx += 1;
+          }
           continue;
         }
 
@@ -222,10 +302,11 @@ exports.get_variable_byid = async function (req, res) {
           values.push(filter_values);
           paramIdx += 1;
         }
+        // Filtros desconocidos se ignoran para no bloquear consultas del orquestador
       }
     }
 
-    const whereSql = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const whereSql = `WHERE ${conditions.join(' AND ')}`;
 
     const query = `
       SELECT
@@ -481,5 +562,43 @@ exports.get_sourceinfo = async function (req, res) {
 };
 
 exports.secuencia = async function (req, res) {
-  return res.status(501).json({ message: 'No aplica para DEM en esta fase' });
+  try {
+    const { variableLevel, variableValue, nextVariableLevel } = req.body || {};
+
+    if (!variableLevel || !nextVariableLevel) {
+      return res.status(400).json({ message: 'Parámetros requeridos: variableLevel, nextVariableLevel' });
+    }
+
+    const current = String(variableLevel).trim().toLowerCase();
+    const next = String(nextVariableLevel).trim().toLowerCase();
+
+    // Única transición soportada: elevation_q<n> → categoria
+    const validCurrent = current.startsWith('elevation') || current === 'dem';
+    if (!validCurrent || next !== 'categoria') {
+      return res.status(400).json({ message: `Transición no soportada: ${current} → ${next}` });
+    }
+
+    // variableValue = idfuente / source_var_id (ej. "1")
+    const rawId = Number(variableValue);
+    const sourceVarId = (Number.isInteger(rawId) && rawId > 0) ? rawId : 1;
+
+    const data = await pool.any(
+      `SELECT
+         b.id::text AS value,
+         CASE
+           WHEN b.min_value IS NOT NULL AND b.max_value IS NOT NULL
+             THEN ROUND(b.min_value::numeric, 2)::text || ' - ' || ROUND(b.max_value::numeric, 2)::text || ' m'
+           ELSE COALESCE(b.label, b.tag, b.id::text)
+         END AS label
+       FROM dem_bins b
+       WHERE b.source_var_id = $1
+       ORDER BY b.bin_index`,
+      [sourceVarId]
+    );
+
+    return res.status(200).json({ data });
+  } catch (error) {
+    debug(error);
+    return res.status(500).json({ message: 'Error interno al obtener secuencia DEM' });
+  }
 };
