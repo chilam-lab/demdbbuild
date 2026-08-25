@@ -266,16 +266,42 @@ exports.get_variable_byid = async function (req, res) {
         }
 
         if (filter_param === 'categoria') {
-          // Los valores son IDs de bin (enteros).
-          // Si no hay enteros válidos (ej. texto del selector como "Dem"), devolver vacío
-          // en lugar de ignorar el filtro y retornar todos los bins.
-          const ids = filter_values.map(Number).filter(n => Number.isInteger(n) && n > 0);
-          if (ids.length === 0) {
+          // Un bin de DEM no tiene nombre propio, solo un rango numérico (min_value/max_value)
+          // y un percentil (bin_index). No sabemos de antemano qué quiso decir el usuario con
+          // un número, así que probamos las tres interpretaciones a la vez (OR), por valor:
+          //   - id interno del bin (ej. 300000)      -> selección desde el árbol
+          //   - percentil (ej. "1", "5")              -> búsqueda por número de categoría
+          //   - valor de elevación dentro del rango (ej. "525", "-161", "2900.5")
+          const orParts = [];
+
+          for (const raw of filter_values) {
+            const trimmed = String(raw).trim();
+            if (!trimmed) continue;
+
+            if (/^\d+$/.test(trimmed)) {
+              const n = Number(trimmed);
+              orParts.push(`b.id = $${paramIdx}`);
+              values.push(n);
+              paramIdx += 1;
+
+              orParts.push(`b.bin_index = $${paramIdx}`);
+              values.push(n);
+              paramIdx += 1;
+            }
+
+            const asNumber = Number(trimmed);
+            if (Number.isFinite(asNumber)) {
+              const idx = paramIdx;
+              values.push(asNumber);
+              paramIdx += 1;
+              orParts.push(`(b.min_value <= $${idx} AND b.max_value >= $${idx})`);
+            }
+          }
+
+          if (orParts.length === 0) {
             return res.status(200).json({ data: [] });
           }
-          conditions.push(`b.id IN ($${paramIdx}:csv)`);
-          values.push(ids);
-          paramIdx += 1;
+          conditions.push(`(${orParts.join(' OR ')})`);
           continue;
         }
 
@@ -313,6 +339,7 @@ exports.get_variable_byid = async function (req, res) {
         s.id AS id,
         b.id AS level_id,
         jsonb_build_object(
+          'idfuente', s.id,
           'categoria', b.layer,
           'tag', b.tag,
           'label', b.label,
@@ -329,7 +356,10 @@ exports.get_variable_byid = async function (req, res) {
       LIMIT ${limit};
     `;
 
-    const data = await pool.any(query, values);
+    const rows = await pool.any(query, values);
+    // El frontend (taxon-selector) espera la clave "data" (igual que WorldClim),
+    // no "datos" — sin este mapeo las sugerencias se ven sin nombre/rango.
+    const data = rows.map(row => ({ id: row.id, level_id: row.level_id, data: row.datos }));
     return res.status(200).json({ data });
   } catch (error) {
     debug(error);
