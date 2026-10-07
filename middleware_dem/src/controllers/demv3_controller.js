@@ -461,6 +461,51 @@ exports.get_data_byid = async function (req, res) {
       }
     }
 
+    // Celdas precalculadas por rango y malla (dbbuild/precompute_dem_cells.py).
+    // Solo sin filtros (los filtros cambian qué rangos aplican); lo que no esté
+    // en dem_cells se sigue calculando en vivo abajo.
+    let cachedResponse = [];
+    if (filter_names.length === 0) {
+      const cachedRows = await pool.any(
+        `SELECT c.bid, c.cells, b.bin_index,
+                jsonb_build_object(
+                  'categoria', b.layer,
+                  'tag', b.tag,
+                  'label', b.label,
+                  'bin_index', b.bin_index,
+                  'min_value', b.min_value,
+                  'max_value', b.max_value,
+                  'value', (b.min_value + b.max_value) / 2.0
+                ) AS metadata
+         FROM dem_cells c
+         JOIN dem_bins b ON b.id = c.bid
+         WHERE c.grid_id = $1 AND c.bid IN ($2:csv) AND b.source_var_id = $3`,
+        [grid_id, levels_id, variable_id]
+      ).catch((err) => { debug('dem_cells lookup:', err.message); return []; });
+
+      cachedResponse = cachedRows.map((r) => ({
+        id: variable_id, grid_id, level_id: Number(r.bid), metadata: r.metadata,
+        cells: r.cells || [], n: (r.cells || []).length, bin_index: r.bin_index
+      }));
+    }
+
+    const cachedBids = new Set(cachedResponse.map((r) => r.level_id));
+    const pendingLevels = levels_id.filter((id) => !cachedBids.has(id));
+
+    const finish = (liveArray) => {
+      const merged = cachedResponse
+        .concat(liveArray.map((r) => ({ ...r, level_id: Number(r.level_id), bin_index: r.metadata && r.metadata.bin_index })))
+        .sort((a, b) => a.bin_index - b.bin_index)
+        .map(({ bin_index, ...r }) => r);
+      resultCache.set(cacheKey, { data: merged, ts: Date.now() });
+      return res.status(200).json(merged);
+    };
+
+    if (pendingLevels.length === 0) {
+      return finish([]);
+    }
+    values[1] = pendingLevels;
+
     const whereSql = `WHERE ${conditionParts.join(' AND ')}`;
 
     const query = `
@@ -497,7 +542,7 @@ exports.get_data_byid = async function (req, res) {
 
     const data = await pool.any(query, values);
     if (!data || data.length === 0) {
-      return res.status(200).json([]);
+      return finish([]);
     }
 
     // Recorta las celdas a la región del grid (ej. México) antes de intersectar
@@ -551,8 +596,7 @@ exports.get_data_byid = async function (req, res) {
       })
     );
 
-    resultCache.set(cacheKey, { data: responseArray, ts: Date.now() });
-    return res.status(200).json(responseArray);
+    return finish(responseArray);
   } catch (error) {
     debug(error);
     return res.status(500).json({
