@@ -142,6 +142,13 @@ def main():
 
     bins = load_bins(dem, only_bids)
 
+    # Rangos que ya no existen en dem_bins (fuente regenerada con otros bins):
+    # sus celdas ya no corresponden a nada.
+    with dem.cursor() as cur:
+        cur.execute("DELETE FROM dem_cells WHERE bid NOT IN (SELECT id FROM dem_bins)")
+        if cur.rowcount:
+            log.info(f"Eliminadas {cur.rowcount} filas de dem_cells de rangos que ya no existen")
+
     for phase_name, resolutions in phases:
         grids = load_grids(mesh, resolutions, only_grids)
         all_grid_ids = [gid for g in grids.values() for gid, _ in g['grids']]

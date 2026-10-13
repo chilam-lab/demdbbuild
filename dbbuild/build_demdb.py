@@ -455,11 +455,28 @@ def load_polygons_to_postgis(nbins: int, source_var_id: int, logger: logging.Log
     return table_name
 
 
+def precompute_cells(logger: logging.Logger) -> None:
+    # Preconteos: celdas de cada rango (dem_bins.id) por malla, en dem_cells.
+    # El middleware (get-data) las lee en vez de cruzar los polígonos en vivo.
+    # --force porque el build regenera los polígonos y los id de dem_bins se
+    # conservan por bin: lo ya guardado puede no corresponder.
+    missing = [k for k in ("DBMESHNAME", "DBMESHHOST", "DBMESHPORT", "DBMESHUSER", "DBMESHPASSWD") if not os.getenv(k)]
+    if missing:
+        logger.warning("Skipping dem_cells precompute: missing env vars: %s", ", ".join(missing))
+        return
+    script = Path(__file__).resolve().parent / "precompute_dem_cells.py"
+    # Sin run_cmd: ese captura la salida y aquí interesa ver el avance en vivo.
+    logger.info("Running: %s --force", script)
+    subprocess.run([sys.executable, str(script), "--force"], check=True)
+    logger.info("dem_cells precomputed")
+
+
 def parse_args() -> argparse.Namespace:
     # Parámetros CLI: número de bins y modo validación.
     parser = argparse.ArgumentParser(description="Build DEM database from WorldClim elevation raster")
     parser.add_argument("--nbins", type=int, default=10, help="Number of bins for discretization")
     parser.add_argument("--dry-run", action="store_true", help="Validate configuration and exit")
+    parser.add_argument("--skip-cells", action="store_true", help="Do not precompute dem_cells at the end")
     return parser.parse_args()
 
 
@@ -497,6 +514,10 @@ def main() -> int:
     load_polygons_to_postgis(args.nbins, source_var_id, logger)
     configure_mesh_fdw(logger)
     update_available_grids(source_var_id, args.nbins, logger)
+    if args.skip_cells:
+        logger.info("Skipping dem_cells precompute (--skip-cells)")
+    else:
+        precompute_cells(logger)
 
     logger.info("DEM build completed successfully")
     return 0
